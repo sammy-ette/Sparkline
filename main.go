@@ -23,10 +23,10 @@ type dataPoint struct{
 type Sparkline struct{
 	db *bolt.DB
 	conn *dbus.Conn
+	slconn *dbus.Conn
 }
 
 func (s *Sparkline) Collect(device string) (map[string]dataPoint, *dbus.Error) {
-	fmt.Println("collect called")
 	data := make(map[string]dataPoint)
 	err := s.db.View(func(tx *bolt.Tx) error {
 		batB := tx.Bucket([]byte(device))
@@ -86,6 +86,11 @@ func (s *Sparkline) Introspect() (string, *dbus.Error) {
 			introspect.IntrospectData,
 			{
 				Name: busName,
+				Signals: []introspect.Signal{
+					{
+						Name: "Update",
+					},
+				},
 				Methods: []introspect.Method{
 					{
 						Name: "Collect",
@@ -97,7 +102,7 @@ func (s *Sparkline) Introspect() (string, *dbus.Error) {
 							},
 							{
 								Name: "data",
-								Type: "s",
+								Type: "a(sdd)",
 								Direction: "out",
 							},
 						},
@@ -139,6 +144,8 @@ func (s *Sparkline) monitor(objectPath dbus.ObjectPath) {
 			percent, _ := device.GetProperty("org.freedesktop.UPower.Device.Percentage")
 			fmt.Println(percent.Value().(float64))
 
+			var dp dataPoint
+
 			err := s.db.Update(func(tx *bolt.Tx) error {
 				percent := getProperty(device, "Percentage").(float64)
 				energyRate := getProperty(device, "EnergyRate").(float64)
@@ -152,35 +159,36 @@ func (s *Sparkline) monitor(objectPath dbus.ObjectPath) {
 				b.Put([]byte("percent"), []byte(strconv.FormatFloat(percent, 'g', -1, 64)))
 				b.Put([]byte("energyRate"), []byte(strconv.FormatFloat(energyRate, 'g', -1, 64)))
 
+				dp = dataPoint{
+					Percentage: percent,
+					EnergyRate: energyRate,
+				}
+
 				return nil
 			})
-
 			if err != nil {
 				panic(err)
 			}
+
+			s.slconn.Emit(objPath, busName + ".Update", dp)
 		}
 	}
 }
 
 func (s *Sparkline) export() {
-	conn, err := dbus.ConnectSessionBus()
-	if err != nil {
-		panic(err)
-	}
-
 	// Export your object
-	err = conn.Export(s, objPath, busName)
+	err := s.slconn.Export(s, objPath, busName)
 	if err != nil {
 		panic(err)
 	}
 
-	err = conn.Export(s, objPath, "org.freedesktop.DBus.Introspectable")
+	err = s.slconn.Export(s, objPath, "org.freedesktop.DBus.Introspectable")
 	if err != nil {
 		panic(err)
 	}
 
 	// Request name on the bus
-	_, err = conn.RequestName(busName, dbus.NameFlagDoNotQueue)
+	_, err = s.slconn.RequestName(busName, dbus.NameFlagDoNotQueue)
 	if err != nil {
 		panic(err)
 	}
@@ -205,6 +213,11 @@ func main() {
 	}
 	defer conn.Close()
 
+	slconn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		panic(err)
+	}
+
 	upower := conn.Object("org.freedesktop.UPower", "/org/freedesktop/UPower")
 	ret := upower.Call("org.freedesktop.UPower.EnumerateDevices", 0)
 	if ret.Err != nil {
@@ -214,6 +227,7 @@ func main() {
 	sl := Sparkline{
 		db: db,
 		conn: conn,
+		slconn: slconn,
 	}
 
 	for _, path := range ret.Body[0].([]dbus.ObjectPath) {
