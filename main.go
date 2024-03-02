@@ -9,15 +9,181 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 	dbus "github.com/godbus/dbus/v5"
+	"github.com/godbus/dbus/introspect"
 )
 
-func getenv(env, fallback string) string {
-	envValue := os.Getenv(env)
-	if envValue == "" {
-		return fallback
+var objPath = dbus.ObjectPath("/party/sammyette/Sparkline")
+var busName = "party.sammyette.Sparkline"
+
+type dataPoint struct{
+	Percentage float64
+	EnergyRate float64
+}
+
+type Sparkline struct{
+	db *bolt.DB
+	conn *dbus.Conn
+}
+
+func (s *Sparkline) Collect(device string) (map[string]dataPoint, *dbus.Error) {
+	fmt.Println("collect called")
+	data := make(map[string]dataPoint)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		batB := tx.Bucket([]byte(device))
+		if batB == nil {
+			return fmt.Errorf("no such device %s", device)
+		}
+
+		// we dont really have to check for errors here, right?
+		err := batB.ForEachBucket(func(bkName []byte) error {
+			dp := dataPoint{}
+			dataPointBucket := batB.Bucket(bkName)
+			if dataPointBucket == nil {
+				return fmt.Errorf("well that's weird")
+			}
+
+			err := dataPointBucket.ForEach(func(k, v []byte) error {
+				switch string(k) {
+					case "percent":
+						percent, err := strconv.ParseFloat(string(v), 64)
+						if err != nil {
+							return fmt.Errorf("thats VERY weird.")
+						}
+						dp.Percentage = percent
+					case "energyRate":
+						energyRate, err := strconv.ParseFloat(string(v), 64)
+						if err != nil {
+							return fmt.Errorf("thats VERY weird.")
+						}
+						dp.EnergyRate = energyRate
+				}
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			data[string(bkName)] = dp
+
+			return nil
+		})
+		return err
+	})
+
+	var dbusErr *dbus.Error
+	if err != nil {
+		dbusErr = dbus.NewError(err.Error(), nil)
 	}
 
-	return envValue
+	return data, dbusErr
+}
+
+func (s *Sparkline) Introspect() (string, *dbus.Error) {
+	introspectData := &introspect.Node{
+		Name: string(objPath),
+		Interfaces: []introspect.Interface{
+			introspect.IntrospectData,
+			{
+				Name: busName,
+				Methods: []introspect.Method{
+					{
+						Name: "Collect",
+						Args: []introspect.Arg{
+							{
+								Name: "device",
+								Type: "s",
+								Direction: "in",
+							},
+							{
+								Name: "data",
+								Type: "s",
+								Direction: "out",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	return string(introspect.NewIntrospectable(introspectData)), nil
+}
+
+func (s *Sparkline) monitor(objectPath dbus.ObjectPath) {
+	rule := fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", objectPath)
+	err := s.conn.BusObject().CallWithContext(context.Background(), "org.freedesktop.DBus.AddMatch", 0, rule).Store()
+	if err != nil {
+		panic(err)
+	}
+
+	device := s.conn.Object("org.freedesktop.UPower", objectPath)
+
+	signals := make(chan *dbus.Signal, 10)
+	s.conn.Signal(signals)
+
+	for signal := range signals {
+		if signal.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
+			changedProps := signal.Body[1].(map[string]dbus.Variant)
+			/*
+			interfaceName := signal.Body[0].(string)
+			invalidatedProps := signal.Body[2].([]string)
+			// Handle property changes
+			fmt.Printf("Interface: %s\n", interfaceName)
+			fmt.Println("Changed properties:")
+			for propName, propValue := range changedProps {
+				fmt.Printf("%s: %v\n", propName, propValue)
+			}
+			fmt.Println("Invalidated properties:", invalidatedProps)
+			*/
+
+			percent, _ := device.GetProperty("org.freedesktop.UPower.Device.Percentage")
+			fmt.Println(percent.Value().(float64))
+
+			err := s.db.Update(func(tx *bolt.Tx) error {
+				percent := getProperty(device, "Percentage").(float64)
+				energyRate := getProperty(device, "EnergyRate").(float64)
+
+				batBucket := tx.Bucket([]byte(objectPath))
+				b, err := batBucket.CreateBucket([]byte(strconv.FormatUint(changedProps["UpdateTime"].Value().(uint64), 10)))
+				if err != nil {
+					return err
+				}
+
+				b.Put([]byte("percent"), []byte(strconv.FormatFloat(percent, 'g', -1, 64)))
+				b.Put([]byte("energyRate"), []byte(strconv.FormatFloat(energyRate, 'g', -1, 64)))
+
+				return nil
+			})
+
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+}
+
+func (s *Sparkline) export() {
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		panic(err)
+	}
+
+	// Export your object
+	err = conn.Export(s, objPath, busName)
+	if err != nil {
+		panic(err)
+	}
+
+	err = conn.Export(s, objPath, "org.freedesktop.DBus.Introspectable")
+	if err != nil {
+		panic(err)
+	}
+
+	// Request name on the bus
+	_, err = conn.RequestName(busName, dbus.NameFlagDoNotQueue)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
@@ -45,17 +211,17 @@ func main() {
 		panic(err)
 	}
 
-	var batteryPath dbus.ObjectPath
-	var battery dbus.BusObject
+	sl := Sparkline{
+		db: db,
+		conn: conn,
+	}
+
 	for _, path := range ret.Body[0].([]dbus.ObjectPath) {
 		bat := conn.Object("org.freedesktop.UPower", path)
 		powerSupply, _ := bat.GetProperty("org.freedesktop.UPower.Device.PowerSupply")
 		present, _ := bat.GetProperty("org.freedesktop.UPower.Device.IsPresent")
 
 		if powerSupply.Value().(bool) && present.Value().(bool){
-			battery = bat
-			batteryPath = path
-
 			err := db.Update(func(tx *bolt.Tx) error {
 				_, err := tx.CreateBucketIfNotExists([]byte(path))
 				if err != nil {
@@ -68,64 +234,13 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+
+			go sl.monitor(path)
 		}
 	}
 
-	// Add match rule for property change signals
-	rule := fmt.Sprintf("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='%s'", batteryPath)
-	err = conn.BusObject().CallWithContext(context.Background(), "org.freedesktop.DBus.AddMatch", 0, rule).Store()
-	if err != nil {
-		panic(err)
-	}
+	sl.export()
 
-	// Handle property change signals
-	signals := make(chan *dbus.Signal, 10)
-	conn.Signal(signals)
-
-	for signal := range signals {
-		if signal.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-			interfaceName := signal.Body[0].(string)
-			changedProps := signal.Body[1].(map[string]dbus.Variant)
-			invalidatedProps := signal.Body[2].([]string)
-			// Handle property changes
-			fmt.Printf("Interface: %s\n", interfaceName)
-			fmt.Println("Changed properties:")
-			for propName, propValue := range changedProps {
-				fmt.Printf("%s: %v\n", propName, propValue)
-			}
-			fmt.Println("Invalidated properties:", invalidatedProps)
-
-			percent, _ := battery.GetProperty("org.freedesktop.UPower.Device.Percentage")
-			fmt.Println(percent.Value().(float64))
-
-			err := db.Update(func(tx *bolt.Tx) error {
-				percent := getProperty(battery, "Percentage").(float64)
-				energyRate := getProperty(battery, "EnergyRate").(float64)
-
-				batBucket := tx.Bucket([]byte(batteryPath))
-				b, err := batBucket.CreateBucket([]byte(strconv.FormatUint(changedProps["UpdateTime"].Value().(uint64), 10)))
-				if err != nil {
-					return err
-				}
-
-				b.Put([]byte("percent"), []byte(strconv.FormatFloat(percent, 'g', -1, 64)))
-				b.Put([]byte("energyRate"), []byte(strconv.FormatFloat(energyRate, 'g', -1, 64)))
-
-				return nil
-			})
-
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
-}
-
-func getProperty(obj dbus.BusObject, property string) interface{} {
-	val, err := obj.GetProperty("org.freedesktop.UPower.Device." + property)
-	if err != nil {
-		panic("failed to retrieve property from battery object" + property)
-	}
-
-	return val.Value()
+	done := make(chan struct{})
+	<-done
 }
