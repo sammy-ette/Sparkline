@@ -1,5 +1,5 @@
 <div align='center'>
-	<img src='[https://safe.saya.moe/rdVO6x3lVloD.png](https://yuki.suou.moe/sparkline_banner-jwRzyczS.png)'>
+	<img src='https://yuki.suou.moe/sparkline_banner-jwRzyczS.png'>
 </div>
 
 Sparkline is a utility for collecting battery data.
